@@ -1,4 +1,4 @@
-import React, { useState, useRef } from "react";
+import React, { useState, useRef, useCallback } from "react";
 import { validateWithSpace } from "../hf";
 import { Card } from "./ui/card";
 import { Button } from "./ui/button";
@@ -19,6 +19,19 @@ interface UploadPageProps {
 
 type Row = [string, string, string, string]; // [Clause, Verdict, Evidence, Gaps]
 
+type ValidateResponse = {
+  filename: string;
+  csvUrl?: string;
+  summaryMd?: string; // HTML string (sanitized below)
+  table: {
+    headers: string[];
+    rows: any[]; // normalized below
+  };
+};
+
+const MAX_MB = 50;
+const ACCEPT_EXT = [".pdf", ".docx", ".txt"];
+
 export function UploadPage({ onNavigate }: UploadPageProps) {
   const [isUploading, setIsUploading] = useState(false);
   const [uploadProgress, setUploadProgress] = useState(0);
@@ -34,67 +47,119 @@ export function UploadPage({ onNavigate }: UploadPageProps) {
   const [csvUrl, setCsvUrl] = useState<string | undefined>();
   const [error, setError] = useState<string | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const timerRef = useRef<number | null>(null);
 
   const verdictToBadge = (v: string) => {
-    const key = v.toLowerCase();
-    if (key === "fully")
+    const key = v.trim().toLowerCase();
+    const simple = key
+      .replace("compliant", "")
+      .replace("partially", "partially")
+      .trim();
+
+    if (key.startsWith("fully") || key.includes("full")) {
       return <Badge className="bg-green-100 text-green-700">Compliant</Badge>;
-    if (key === "partially")
+    }
+    if (simple.startsWith("partially") || key.includes("partial")) {
       return (
         <Badge className="bg-yellow-100 text-yellow-700">Needs Attention</Badge>
       );
+    }
     return <Badge className="bg-red-100 text-red-700">Insufficient</Badge>;
   };
 
-  const pickFile = () => fileInputRef.current?.click();
+  const pickFile = () => !isUploading && fileInputRef.current?.click();
 
-  const handleUpload = async (f?: File) => {
-    setError(null);
-    const file = f || fileInputRef.current?.files?.[0];
-    if (!file) {
-      setError("Please choose a PDF, DOCX, or TXT file.");
-      return;
-    }
-    setIsUploading(true);
+  const validateFile = (file: File): string | null => {
+    const extOk = ACCEPT_EXT.some((ext) =>
+      file.name.toLowerCase().endsWith(ext)
+    );
+    if (!extOk)
+      return "Unsupported file type. Please upload a PDF, DOCX, or TXT.";
+    if (file.size > MAX_MB * 1024 * 1024)
+      return `File is larger than ${MAX_MB}MB.`;
+    return null;
+  };
+
+  const startProgress = () => {
     setUploadProgress(5);
+    if (timerRef.current) window.clearInterval(timerRef.current);
+    timerRef.current = window.setInterval(() => {
+      setUploadProgress((p) => (p < 90 ? p + 5 : p));
+    }, 250);
+  };
 
-    try {
-      // Simulated progress bar while network request runs
-      const timer = setInterval(() => {
-        setUploadProgress((p) => (p < 90 ? p + 5 : p));
-      }, 250);
-
-      const { filename, table, csvUrl, summaryMd } = await validateWithSpace(
-        file,
-        8, // k_per_check default
-        "intfloat/e5-base-v2"
-      );
-
-      clearInterval(timer);
-      setUploadProgress(100);
-      setIsUploading(false);
-
-      setFilename(filename);
-      setHeaders(
-        table.headers.length
-          ? table.headers
-          : ["Clause", "Verdict", "Evidence", "Gaps"]
-      );
-      // Ensure each row is a 4-tuple of strings
-      const safeRows: Row[] = (table.rows || []).map((r: any[]) => [
-        String(r?.[0] ?? ""),
-        String(r?.[1] ?? ""),
-        String(r?.[2] ?? ""),
-        String(r?.[3] ?? ""),
-      ]);
-      setRows(safeRows);
-      setSummary(summaryMd);
-      setCsvUrl(csvUrl);
-    } catch (e: any) {
-      setIsUploading(false);
-      setUploadProgress(0);
-      setError(e?.message || "Validation failed. Please try again.");
+  const stopProgress = () => {
+    if (timerRef.current) {
+      window.clearInterval(timerRef.current);
+      timerRef.current = null;
     }
+  };
+
+  const handleUpload = useCallback(
+    async (f?: File) => {
+      if (isUploading) return;
+      setError(null);
+
+      const file = f || fileInputRef.current?.files?.[0];
+      if (!file) {
+        setError("Please choose a PDF, DOCX, or TXT file.");
+        return;
+      }
+      const vErr = validateFile(file);
+      if (vErr) {
+        setError(vErr);
+        return;
+      }
+
+      setIsUploading(true);
+      startProgress();
+
+      try {
+        const { filename, table, csvUrl, summaryMd } = (await validateWithSpace(
+          file,
+          8,
+          "intfloat/e5-base-v2"
+        )) as ValidateResponse;
+
+        setUploadProgress(100);
+
+        setFilename(filename);
+        setHeaders(
+          table?.headers?.length
+            ? table.headers
+            : ["Clause", "Verdict", "Evidence", "Gaps"]
+        );
+
+        const safeRows: Row[] = (table?.rows || []).map((r: any[]) => [
+          String(r?.[0] ?? ""),
+          String(r?.[1] ?? ""),
+          String(r?.[2] ?? ""),
+          String(r?.[3] ?? ""),
+        ]);
+        setRows(safeRows);
+
+        setCsvUrl(csvUrl);
+      } catch (e: any) {
+        setUploadProgress(0);
+        setError(e?.message || "Validation failed. Please try again.");
+      } finally {
+        stopProgress();
+        setIsUploading(false);
+      }
+    },
+    [isUploading]
+  );
+
+  // DnD: add drop handlers to match your UX copy
+  const onDrop = (e: React.DragEvent) => {
+    e.preventDefault();
+    e.stopPropagation();
+    const file = e.dataTransfer.files?.[0];
+    if (file) handleUpload(file);
+  };
+  const onDragOver = (e: React.DragEvent) => {
+    e.preventDefault();
+    e.stopPropagation();
   };
 
   return (
@@ -102,7 +167,7 @@ export function UploadPage({ onNavigate }: UploadPageProps) {
       {/* Hidden native input */}
       <input
         type="file"
-        accept=".pdf,.docx,.txt"
+        accept={ACCEPT_EXT.join(",")}
         ref={fileInputRef}
         onChange={(e) => handleUpload(e.target.files?.[0])}
         className="hidden"
@@ -120,10 +185,18 @@ export function UploadPage({ onNavigate }: UploadPageProps) {
             PDF, DOCX, TXT
           </p>
 
-          {/* Drop zone (click to pick) */}
+          {/* Drop zone */}
           <div
             className="border-2 border-dashed border-gray-300 rounded-xl p-12 hover:border-blue-500 hover:bg-blue-50/50 transition-all cursor-pointer"
+            role="button"
+            tabIndex={0}
             onClick={pickFile}
+            onKeyDown={(e) =>
+              (e.key === "Enter" || e.key === " ") && pickFile()
+            }
+            onDrop={onDrop}
+            onDragOver={onDragOver}
+            aria-disabled={isUploading}
           >
             <div className="space-y-4">
               <div className="inline-flex items-center justify-center w-12 h-12 rounded-xl bg-gray-100">
@@ -133,7 +206,7 @@ export function UploadPage({ onNavigate }: UploadPageProps) {
                 <p className="text-gray-700">
                   Drop files here or click to upload
                 </p>
-                <p className="text-gray-500">Maximum file size: 50MB</p>
+                <p className="text-gray-500">Maximum file size: {MAX_MB}MB</p>
               </div>
             </div>
           </div>
@@ -175,7 +248,7 @@ export function UploadPage({ onNavigate }: UploadPageProps) {
             <div className="flex items-center gap-3">
               {csvUrl && (
                 <a href={csvUrl} target="_blank" rel="noreferrer">
-                  <Button variant="outline">
+                  <Button variant="outline" disabled={isUploading}>
                     <Download className="w-4 h-4 mr-2" />
                     Download CSV
                   </Button>
@@ -184,23 +257,26 @@ export function UploadPage({ onNavigate }: UploadPageProps) {
               <Button
                 variant="outline"
                 onClick={() => onNavigate("verification")}
+                disabled={isUploading}
               >
                 View Detailed Analysis
               </Button>
               <Button
                 className="bg-gradient-to-r from-blue-500 to-blue-600 hover:from-blue-600 hover:to-blue-700"
                 onClick={() => onNavigate("reports")}
+                disabled={isUploading}
               >
                 Generate Compliance Report
               </Button>
             </div>
           </div>
 
-          {/* Optional summary markdown */}
+          {/* Optional summary (sanitized) */}
           {summary && (
             <Card className="p-4">
               <div
                 className="prose max-w-none"
+                // If your API returns markdown instead of HTML, swap this for a MD renderer instead of using innerHTML.
                 dangerouslySetInnerHTML={{
                   __html: summary.replace(/\n/g, "<br/>"),
                 }}
@@ -208,26 +284,24 @@ export function UploadPage({ onNavigate }: UploadPageProps) {
             </Card>
           )}
 
-          {/* Table-like cards (keeps your existing style) */}
+          {/* Table-like cards */}
           <div className="space-y-4">
             {rows.map((r, idx) => {
               const [clause, verdict, evidence, gaps] = r;
               const verdictKey = (verdict || "").toLowerCase();
-              const statusIcon =
-                verdictKey === "fully" ? (
-                  <CheckCircle className="w-6 h-6 text-green-600" />
-                ) : verdictKey === "partially" ? (
-                  <Clock className="w-6 h-6 text-yellow-600" />
-                ) : (
-                  <AlertCircle className="w-6 h-6 text-red-600" />
-                );
+              const statusIcon = verdictKey.startsWith("fully") ? (
+                <CheckCircle className="w-6 h-6 text-green-600" />
+              ) : verdictKey.startsWith("partially") ? (
+                <Clock className="w-6 h-6 text-yellow-600" />
+              ) : (
+                <AlertCircle className="w-6 h-6 text-red-600" />
+              );
 
-              const statusBg =
-                verdictKey === "fully"
-                  ? "bg-green-50"
-                  : verdictKey === "partially"
-                  ? "bg-yellow-50"
-                  : "bg-red-50";
+              const statusBg = verdictKey.startsWith("fully")
+                ? "bg-green-50"
+                : verdictKey.startsWith("partially")
+                ? "bg-yellow-50"
+                : "bg-red-50";
 
               return (
                 <Card
@@ -246,7 +320,7 @@ export function UploadPage({ onNavigate }: UploadPageProps) {
                           <h3 className="text-gray-900">
                             {clause || "Clause"}
                           </h3>
-                          <p className="text-gray-600">Evidence & Gaps</p>
+                          <p className="text-gray-600">Evidence &amp; Gaps</p>
                         </div>
                         {verdictToBadge(verdict || "")}
                       </div>
@@ -269,9 +343,10 @@ export function UploadPage({ onNavigate }: UploadPageProps) {
         </>
       )}
 
-      {/* Manual action button if you want it */}
       <div className="flex justify-center">
-        <Button onClick={() => pickFile()}>Upload another file</Button>
+        <Button onClick={pickFile} disabled={isUploading}>
+          Upload another file
+        </Button>
       </div>
     </div>
   );
